@@ -46,20 +46,20 @@ pip install -r requirements.txt
 ```
 
 ## Usage
-Commands for training and testing the model with *ProbSparse* self-attention on Dataset ETTh1, ETTh2 and ETTm1 respectively:
+Basic commands for training and testing the LTSMiTransformer (and ablation variants - TSMiTransformer and LTSiTransformer) model on Dataset ETTh1, ETTh2 and ETTm1 respectively:
 
 ```bash
 # ETTh1
-python -u main_informer.py --model informer --data ETTh1 --attn prob --freq h
+python -u main.py --model LTSMiTransformer --data ETTh1 --memory_slots 20
 
 # ETTh2
-python -u main_informer.py --model informer --data ETTh2 --attn prob --freq h
+python -u main.py --model TSMiTransformer --data ETTh2 --memory_slots 20 --sparsity_factor 0.2
 
 # ETTm1
-python -u main_informer.py --model informer --data ETTm1 --attn prob --freq t
+python -u main.py --model LTSiTransformer --data ETTm1 
 ```
 
-More parameter information please refer to `main_informer.py`.
+More parameter information please refer to `main.py`.
 
 ## <span id="resultslink">Results</span>
 
