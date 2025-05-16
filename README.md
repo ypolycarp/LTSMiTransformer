@@ -20,6 +20,6 @@ LTSMiTransformer is a lightweight yet powerful Transformer-based architecture de
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/your-username/LTSMiTransformer.git
+git clone https://github.com/polycarp/LTSMiTransformer.git
 cd LTSMiTransformer
 pip install -r requirements.txt
