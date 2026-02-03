@@ -50,13 +50,13 @@ Basic commands for training and testing the LTSMiTransformer (and ablation varia
 
 ```bash
 # ETTh1
-python -u main.py --model LTSMiTransformer --data ETTh1 --memory_slots 20
+python -u main.py --model LTSMiTransformer --root_path ./data/ETT --data ETTh1 --pred_len 336 --memory_slots 20
 
 # ETTh2
-python -u main.py --model TSMiTransformer --data ETTh2 --memory_slots 20 --sparsity_factor 0.2
+python -u main.py --model TSMiTransformer --root_path ./data/ETT --data ETTh2 --memory_slots 20 --sparsity_factor 0.2
 
-# ETTm1
-python -u main.py --model LTSiTransformer --data ETTm1 
+# ECL
+python -u main.py --model LTSMiTransformer --root_path ./data/ --data ECL
 ```
 
 More parameter information please refer to `main.py`.
