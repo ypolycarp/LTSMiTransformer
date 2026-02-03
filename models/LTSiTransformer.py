@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
+def compute_K_tau_L(tau: torch.Tensor, L: int) -> int:
+    """Compute K(τ,L)=ceil((1+τ) log2 L)."""
+    return int(math.ceil((1.0 + float(torch.clamp(tau, 0.0, 1.0).item())) * math.log2(max(int(L), 2))))
 
 class TriangularCausalMask():
     def __init__(self, B, L, device="cpu"):
@@ -126,77 +129,142 @@ class AttentionLayer(nn.Module):
         return self.out_projection(out), attn
 
 class LearnableTemporalSparseAttention(nn.Module):
-    def __init__(self, mask_flag=True, scale=None, attention_dropout=0.1, output_attention=False):
-        super(LearnableTemporalSparseAttention, self).__init__()
+    """
+    Learnable Temporal Sparse Attention (LTSA) without external memory.
+
+    Matches the paper's τ–TopK formulation:
+      - score shifting: s̃_t = s_t - τ
+      - τ-controlled logarithmic budget: K(τ,L)=ceil((1+τ) log2 L)
+      - hard TopK sparsification in the forward pass, with an STE-style surrogate in backprop.
+    """
+
+    def __init__(
+        self,
+        mask_flag=True,
+        scale=None,
+        attention_dropout=0.1,
+        output_attention=False,
+        tau_init=0.5,
+        ste_temperature=10.0,
+        neg_inf=-1e9,
+    ):
+        super().__init__()
         self.scale = scale
         self.mask_flag = mask_flag
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
 
-        # Learnable sparsity pattern: An additional small attention layer
-        self.sparsity_generator = nn.Sequential(
-            nn.Linear(1, 16),  # Single input feature (time index), project to 16D
-            nn.ReLU(),
-            nn.Linear(16, 1),  # Project back to 1D (sparsity score)
-            nn.Sigmoid()  # Output in range (0,1)
-        )
+        self.tau = nn.Parameter(torch.tensor(float(tau_init), dtype=torch.float32))
+        self.ste_temperature = float(ste_temperature)
+        self.neg_inf = float(neg_inf)
+
+        # score_net will be initialized lazily once head dim E is known (first forward)
+        self._score_net = None
+
+    @staticmethod
+    def _K_tau_L(tau_scalar: float, L: int) -> int:
+        return int(math.ceil((1.0 + tau_scalar) * math.log2(max(int(L), 2))))
+
+    def effective_K(self, L: int, tau_override: torch.Tensor | None = None) -> int:
+        tau_eff = tau_override if tau_override is not None else self.tau
+        tau_val = float(torch.clamp(tau_eff, 0.0, 1.0).item())
+        return self._K_tau_L(tau_val, L)
+
+    def _ensure_score_net(self, E: int, device):
+        if self._score_net is None:
+            self._score_net = nn.Sequential(
+                nn.Linear(E, 16),
+                nn.ReLU(),
+                nn.Linear(16, 1),
+                nn.Sigmoid(),
+            ).to(device)
+
+    def _build_mask_ste(self, s_tilde: torch.Tensor, K: int) -> torch.Tensor:
+        L = s_tilde.shape[0]
+        K = max(1, min(int(K), int(L)))
+        _, idx = torch.topk(s_tilde, k=K, dim=0)
+        m_hard = torch.zeros(L, device=s_tilde.device, dtype=torch.float32)
+        m_hard[idx] = 1.0
+        m_soft = torch.sigmoid(self.ste_temperature * s_tilde)
+        return m_hard + (m_soft - m_soft.detach())
 
     def forward(self, queries, keys, values, attn_mask=None, tau=None, delta=None):
-        B, L, H, E = queries.shape  # Batch, Length, Heads, Embedding Size
+        B, L, H, E = queries.shape
         _, S, _, D = values.shape
+        assert L == S, "This LTSA implementation assumes self-attention (L == S)."
 
-        scale = self.scale or 1. / math.sqrt(E)
+        device = queries.device
+        self._ensure_score_net(E, device)
 
-        # Compute raw attention scores
-        scores = torch.einsum("blhe,bshe->bhls", queries, keys)
+        scale = self.scale or 1.0 / math.sqrt(E)
 
-        if self.mask_flag:
-            if attn_mask is None:
-                attn_mask = torch.ones_like(scores, dtype=torch.bool)  # Start with all True (no attention)
+        tau_eff = tau if tau is not None else self.tau
+        tau_eff = torch.clamp(tau_eff, 0.0, 1.0)
 
-                # Learn a sparsity score for each position dynamically
-                time_indices = torch.arange(L, device=queries.device).float().unsqueeze(1)  # Shape: [L, 1]
-                sparsity_scores = self.sparsity_generator(time_indices).squeeze(-1)  # Shape: [L]
-                
-                # Convert sparsity scores to a binary mask (thresholding)
-                threshold = sparsity_scores.mean()
-                sparse_mask = sparsity_scores > threshold  # Positions with score > mean are attended to
-                
-                # Expand mask to match attention scores shape
-                sparse_mask = sparse_mask.unsqueeze(0).unsqueeze(0).expand(B, H, L, S)
-                attn_mask = attn_mask & sparse_mask  # Apply learned sparsity
+        # Temporal scoring from keys: [B,L,H,E] -> [L,E] -> [L]
+        k_feat = keys.mean(dim=(0, 2))                  # [L,E]
+        s = self._score_net(k_feat).squeeze(-1)         # [L]
+        s_tilde = s - tau_eff                           # [L]
 
-            scores.masked_fill_(~attn_mask, -np.inf)  # Mask out unselected positions
+        K = self.effective_K(L, tau_override=tau_eff)
+        m = self._build_mask_ste(s_tilde, K)            # [L]
 
-        A = self.dropout(torch.softmax(scale * scores, dim=-1))
-        V = torch.einsum("bhls,bshd->blhd", A, values)
+        scores = torch.einsum("blhe,bshe->bhls", queries, keys) * scale  # [B,H,L,S]
+        scores = scores + (m.view(1, 1, 1, S) - 1.0) * self.neg_inf
+
+        if self.mask_flag and attn_mask is not None:
+            if attn_mask.dim() != 4:
+                raise ValueError("attn_mask should have shape [B, 1/H, L, S].")
+            if attn_mask.shape[1] == 1:
+                attn_mask = attn_mask.expand(B, H, L, S)
+            scores = scores.masked_fill(~attn_mask, self.neg_inf)
+
+        A = self.dropout(torch.softmax(scores, dim=-1))
+        V = torch.einsum("bhls,bshd->blhd", A, values)  # [B,L,H,D]
 
         if self.output_attention:
-            return (V.contiguous(), A)
-        else:
-            return (V.contiguous(), None)
+            return V.contiguous(), A
+        return V.contiguous(), None
 
-# Learnable Temporal Sparse iTransformer
 class LTSiTransformer(nn.Module):
     """
-        Modified iTransformer with TemporalSparseAttention that can learn, adapt and decide the appropriate top-k queries to search for
+    LTSiTransformer ablation: τ–TopK LTSA retained, MAM disabled (i.e., no external memory).
     """
 
-    def __init__(self, enc_in, dec_in, c_out, seq_len, label_len, out_len,
-                 factor=5, d_model=512, n_heads=8, e_layers=3, d_layers=2, d_ff=512,
-                 dropout=0.0, attn='prob', embed='fixed', freq='h', activation='gelu',
-                 output_attention=False, distil=True, mix=True, class_strategy='projection', use_norm=True,
-                 device=torch.device('cuda:0')):
-        super(LTSiTransformer, self).__init__()
+    def __init__(
+        self,
+        enc_in,
+        dec_in,
+        c_out,
+        seq_len,
+        label_len,
+        out_len,
+        factor=5,
+        d_model=512,
+        n_heads=8,
+        e_layers=3,
+        d_layers=2,
+        d_ff=512,
+        dropout=0.0,
+        attn='prob',
+        embed='fixed',
+        freq='h',
+        activation='gelu',
+        output_attention=False,
+        distil=True,
+        mix=True,
+        class_strategy='projection',
+        use_norm=True,
+        device=torch.device('cuda:0'),
+    ):
+        super().__init__()
         self.seq_len = seq_len
         self.pred_len = out_len
         self.output_attention = output_attention
         self.use_norm = use_norm
 
-        # Embedding
         self.enc_embedding = DataEmbedding_inverted(seq_len, d_model, embed, freq, dropout)
 
-        # Encoder with Learnable Temporal Sparse Attention
         self.encoder = Encoder(
             [
                 EncoderLayer(
@@ -204,13 +272,23 @@ class LTSiTransformer(nn.Module):
                     n_heads=n_heads,
                     d_ff=d_ff,
                     dropout=dropout,
-                    activation=activation
-                ) for _ in range(e_layers)
+                    activation=activation,
+                )
+                for _ in range(e_layers)
             ],
-            norm_layer=torch.nn.LayerNorm(d_model)
+            norm_layer=torch.nn.LayerNorm(d_model),
         )
 
         self.projector = nn.Linear(d_model, out_len, bias=True)
+
+    def get_tau(self) -> float:
+        attn = self.encoder.attn_layers[0].attention.inner_attention
+        return float(attn.tau.detach().cpu().item())
+
+    def effective_K(self, L: int | None = None) -> int:
+        L = int(L) if L is not None else int(self.seq_len)
+        attn = self.encoder.attn_layers[0].attention.inner_attention
+        return attn.effective_K(L)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         if self.use_norm:
@@ -221,7 +299,9 @@ class LTSiTransformer(nn.Module):
 
         _, _, N = x_enc.shape
         enc_out = self.enc_embedding(x_enc, x_mark_enc)
+
         enc_out, attns = self.encoder(enc_out, attn_mask=None)
+
         dec_out = self.projector(enc_out).permute(0, 2, 1)[:, :, :N]
 
         if self.use_norm:
