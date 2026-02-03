@@ -46,7 +46,7 @@ pip install -r requirements.txt
 ```
 
 ## Usage
-Basic commands for training and testing the LTSMiTransformer (and ablation variants - TSMiTransformer and LTSiTransformer) model on Dataset ETTh1, ETTh2 and ETTm1 respectively:
+Basic commands for training and testing the LTSMiTransformer (and ablation variants - TSMiTransformer and LTSiTransformer) model on Dataset ETTh1, ETTh2 and ECL respectively:
 
 ```bash
 # ETTh1
