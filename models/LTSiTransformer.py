@@ -131,11 +131,7 @@ class AttentionLayer(nn.Module):
 class LearnableTemporalSparseAttention(nn.Module):
     """
     Learnable Temporal Sparse Attention (LTSA) without external memory.
-
-    Matches the paper's τ–TopK formulation:
-      - score shifting: s̃_t = s_t - τ
-      - τ-controlled logarithmic budget: K(τ,L)=ceil((1+τ) log2 L)
-      - hard TopK sparsification in the forward pass, with an STE-style surrogate in backprop.
+    
     """
 
     def __init__(
